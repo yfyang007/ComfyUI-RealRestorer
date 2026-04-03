@@ -1,12 +1,19 @@
-# ComfyUI-RealRestorer
+<div align="center">
+  <h2>ComfyUI-RealRestorer: ComfyUI Integration for RealRestorer</h2>
+  <p>
+    <a href="https://yfyang007.github.io/RealRestorer/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="Project Page"/></a>
+    <a href="https://arxiv.org/abs/2603.25502"><img src="https://img.shields.io/badge/arXiv-2603.25502-b31b1b.svg" alt="arXiv Paper"/></a>
+    <a href="https://huggingface.co/RealRestorer/RealRestorer"><img src="https://img.shields.io/badge/HuggingFace-Model-yellow.svg" alt="HuggingFace Model"/></a>
+    <a href="https://huggingface.co/datasets/RealRestorer/RealIR-Bench"><img src="https://img.shields.io/badge/HuggingFace-RealIR--Bench-green.svg" alt="HuggingFace RealIR-Bench"/></a>
+    <a href="https://huggingface.co/spaces/dericky286/RealRestorer-Demo"><img src="https://img.shields.io/badge/HuggingFace-Demo-orange.svg" alt="HuggingFace Demo"/></a>
+    <a href="https://github.com/yfyang007/RealRestorer"><img src="https://img.shields.io/badge/GitHub-Official%20Repo-black.svg" alt="Official Repo"/></a>
+  </p>
+</div>
 
 Standalone ComfyUI node pack for **RealRestorer** image restoration.
 
-**No vendored diffusers fork.** All model code is self-contained. Safe to install
-into any existing ComfyUI environment without breaking dependencies.
-
 This repository is a ComfyUI integration built on top of the official
-**RealRestorer** release.
+**RealRestorer** release:
 
 - Project page: https://yfyang007.github.io/RealRestorer/
 - Paper: https://arxiv.org/abs/2603.25502
@@ -14,6 +21,9 @@ This repository is a ComfyUI integration built on top of the official
 - Hugging Face model: https://huggingface.co/RealRestorer/RealRestorer
 - Hugging Face benchmark: https://huggingface.co/datasets/RealRestorer/RealIR-Bench
 - Hugging Face demo: https://huggingface.co/spaces/dericky286/RealRestorer-Demo
+
+**No vendored diffusers fork.** All model code is self-contained. Safe to install
+into any existing ComfyUI environment without breaking dependencies.
 
 
 ## Why This Exists
