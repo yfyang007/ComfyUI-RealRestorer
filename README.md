@@ -12,6 +12,8 @@
 
 Standalone ComfyUI node pack for **RealRestorer** image restoration.
 
+Special thanks to [CCP6](https://huggingface.co/CCP6) for support and community contribution.
+
 This repository is a ComfyUI integration built on top of the official
 **RealRestorer** release:
 
