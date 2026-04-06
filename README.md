@@ -105,10 +105,15 @@ At 1024x1024 with bfloat16:
 |---|---|---|---|
 | full_gpu | ~34 GB | Fastest | 48GB+ cards |
 | offload_to_cpu | ~24 GB peak | Moderate | 26-48GB cards |
-| sequential_offload | ~6-8 GB peak | Slowest | 24GB cards (RTX 3090/4090) |
+| sequential_offload | Fills available | Near offload_to_cpu on 24GB | 24GB cards (3090/4090/5090) |
 
 **auto** picks `full_gpu` for >40GB, `offload_to_cpu` for >26GB, or
 `sequential_offload` otherwise.
+
+The key difference between `offload_to_cpu` and `sequential_offload` is not
+speed -- it is whether the card can run it at all.  `offload_to_cpu` loads
+the full ~24GB transformer to GPU at once, which OOMs on 24GB cards.
+`sequential_offload` only loads what fits.
 
 ### How sequential_offload works
 
