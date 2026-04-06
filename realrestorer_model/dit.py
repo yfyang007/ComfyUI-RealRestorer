@@ -128,7 +128,18 @@ class Step1XEdit(nn.Module):
         t_vec: Tensor,
         mask: Tensor,
         guidance: Tensor | None = None,
+        block_device: torch.device | None = None,
     ) -> Tensor:
+        """
+        Forward pass through the Step1X-Edit DiT.
+
+        When block_device is set, each transformer block is temporarily moved
+        to that device for computation and then moved back to CPU.  This
+        "sequential offload" mode keeps peak VRAM at roughly one block plus
+        activations instead of the full ~24 GB transformer.  The non-block
+        layers (embedders, connector, final_layer, etc.) must already reside
+        on block_device before calling this.
+        """
         txt, y = self.connector(llm_embedding, t_vec, mask)
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -145,12 +156,34 @@ class Step1XEdit(nn.Module):
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
 
-        for block in self.double_blocks:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+        if block_device is not None:
+            # Sequential offload: only stream blocks that are NOT already on
+            # the compute device.  Blocks pre-loaded by the pipeline stay put.
+            for block in self.double_blocks:
+                on_device = next(block.parameters()).device.type == block_device.type
+                if not on_device:
+                    block.to(block_device)
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+                if not on_device:
+                    block.to("cpu")
+        else:
+            for block in self.double_blocks:
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
 
         img = torch.cat((txt, img), 1)
-        for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe)
+
+        if block_device is not None:
+            for block in self.single_blocks:
+                on_device = next(block.parameters()).device.type == block_device.type
+                if not on_device:
+                    block.to(block_device)
+                img = block(img, vec=vec, pe=pe)
+                if not on_device:
+                    block.to("cpu")
+        else:
+            for block in self.single_blocks:
+                img = block(img, vec=vec, pe=pe)
+
         img = img[:, txt.shape[1]:, ...]
 
         return self.final_layer(img, vec)

@@ -94,19 +94,38 @@ ComfyUI/models/RealRestorer/
 | steps | 28 | Paper default (demo range: 12-40) |
 | guidance_scale | 3.0 | Paper default (demo range: 1.0-6.0) |
 | size_level | 1024 | Processing resolution (see tooltip) |
-| device_strategy | auto | auto / full_gpu / offload_to_cpu |
+| device_strategy | auto | auto / full_gpu / offload_to_cpu / sequential_offload |
 
 
 ## VRAM Usage
 
 At 1024x1024 with bfloat16:
 
-| Strategy | Peak VRAM | Speed |
-|---|---|---|
-| full_gpu | ~34 GB | Fastest |
-| offload_to_cpu | ~18 GB peak | Slower |
+| Strategy | Peak VRAM | Speed | Recommended for |
+|---|---|---|---|
+| full_gpu | ~34 GB | Fastest | 48GB+ cards |
+| offload_to_cpu | ~24 GB peak | Moderate | 26-48GB cards |
+| sequential_offload | ~6-8 GB peak | Slowest | 24GB cards (RTX 3090/4090) |
 
-With 96GB VRAM, `full_gpu` is recommended.
+**auto** picks `full_gpu` for >40GB, `offload_to_cpu` for >26GB, or
+`sequential_offload` otherwise.
+
+### How sequential_offload works
+
+The transformer (~12B params, ~24GB in bf16) is too large to fit on a 24GB card
+all at once. Sequential offload loads only the lightweight parts (embedders,
+connector, final layer: ~1-2GB) to GPU, then **pre-loads as many of the 57
+transformer blocks as will fit** in remaining VRAM.  Blocks that don't fit are
+streamed from CPU one at a time during each denoising step.
+
+On a 24GB card (after text encoder is offloaded): ~18-20GB free for blocks,
+each block ~400MB, so **~45 of 57 blocks stay on GPU** permanently. Only ~12
+blocks need streaming per step, which is much faster than streaming all 57.
+
+On a 48GB+ card: all 57 blocks fit, so sequential_offload runs at nearly the
+same speed as offload_to_cpu with no streaming overhead.
+
+The console log shows exactly how many blocks were pre-loaded vs streamed.
 
 
 ## Credits
