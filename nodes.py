@@ -354,15 +354,20 @@ class RealRestorerSampler:
                     ),
                 }),
                 "device_strategy": (
-                    ["auto", "full_gpu", "offload_to_cpu"],
+                    ["auto", "full_gpu", "offload_to_cpu", "sequential_offload"],
                     {
                         "default": "auto",
                         "tooltip": (
-                            "How to manage GPU memory.\n"
-                            "- auto: Uses full_gpu if >40GB VRAM, otherwise offloads.\n"
+                            "How to manage GPU memory.\n\n"
+                            "- auto: Uses full_gpu if >40GB VRAM, offload_to_cpu if >26GB, "
+                            "otherwise sequential_offload.\n"
                             "- full_gpu: All components stay on GPU. Fastest. ~34GB at size 1024.\n"
                             "- offload_to_cpu: Components move to CPU when not in use. "
-                            "Slower but ~18GB peak VRAM."
+                            "Slower but ~24GB peak (the transformer weight size).\n"
+                            "- sequential_offload: Pre-loads as many transformer blocks to "
+                            "GPU as VRAM allows, streams the rest from CPU. On a 24GB card "
+                            "most blocks stay on GPU with only ~12 streaming. Enables cards "
+                            "that can't fit the full transformer."
                         ),
                     },
                 ),
@@ -409,19 +414,24 @@ class RealRestorerSampler:
         device = mm.get_torch_device()
 
         if device_strategy == "auto":
-            free_vram = 0
+            total_vram = 0
             if torch.cuda.is_available():
-                free_vram = torch.cuda.get_device_properties(0).total_memory
-            if free_vram > 40 * 1024**3:
+                total_vram = torch.cuda.get_device_properties(0).total_memory
+            if total_vram > 40 * 1024**3:
                 device_strategy = "full_gpu"
-            else:
+            elif total_vram > 26 * 1024**3:
                 device_strategy = "offload_to_cpu"
+            else:
+                device_strategy = "sequential_offload"
+            print(f"[RealRestorer] Auto-selected device strategy: {device_strategy}", flush=True)
 
         from .realrestorer_model.pipeline import run_realrestorer
 
-        use_offload = (device_strategy == "offload_to_cpu")
+        use_offload = device_strategy in ("offload_to_cpu", "sequential_offload")
+        use_sequential = (device_strategy == "sequential_offload")
 
         if not use_offload:
+            # full_gpu: move everything to GPU once
             transformer.to(device)
             vae.to(device)
             text_encoder.to(device)
@@ -461,6 +471,7 @@ class RealRestorerSampler:
                 version=version,
                 device=device,
                 offload=use_offload,
+                sequential_offload=use_sequential,
                 step_callback=_step_callback,
             )
 

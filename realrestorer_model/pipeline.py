@@ -241,8 +241,14 @@ def denoise_edit(
     timesteps, guidance_scale, model_guidance,
     timesteps_truncate=0.93, process_norm_power=0.4,
     step_callback=None,
+    block_device=None,
 ) -> torch.Tensor:
-    """Edit-mode denoise loop (image restoration)."""
+    """Edit-mode denoise loop (image restoration).
+
+    When block_device is not None it is forwarded to the transformer so that
+    each block is streamed to the compute device one at a time (sequential
+    offload mode).
+    """
     total_steps = len(timesteps) - 1
     for step_idx, t in enumerate(timesteps[:-1]):
         latent_model_input = latents.repeat(2, 1, 1) if guidance_scale != -1 else latents
@@ -266,6 +272,7 @@ def denoise_edit(
             t_vec=t_vec,
             mask=prompt_mask,
             guidance=guidance_vec,
+            block_device=block_device,
         )
 
         pred = pred_full[:, :latents.shape[1]]
@@ -319,6 +326,32 @@ def _offload_to_cpu(module, label=""):
         print(f"[RealRestorer] Offloaded {label} to CPU.", flush=True)
 
 
+def _move_transformer_nonblocks(transformer, device):
+    """Move only the non-block (lightweight) parts of the transformer to a
+    device.  The double_blocks and single_blocks stay where they are so that
+    sequential offload can stream them one at a time.
+
+    Approximate VRAM cost: ~1-2 GB instead of ~24 GB for the full model.
+    """
+    transformer.pe_embedder.to(device)
+    transformer.img_in.to(device)
+    transformer.time_in.to(device)
+    transformer.vector_in.to(device)
+    transformer.guidance_in.to(device)
+    transformer.txt_in.to(device)
+    transformer.connector.to(device)
+    transformer.final_layer.to(device)
+    if transformer.mask_token is not None:
+        transformer.mask_token.data = transformer.mask_token.data.to(device)
+
+
+def _offload_transformer_nonblocks(transformer):
+    """Move the non-block parts back to CPU."""
+    _move_transformer_nonblocks(transformer, "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 @torch.inference_mode()
 def run_realrestorer(
     text_encoder,
@@ -339,17 +372,29 @@ def run_realrestorer(
     process_norm_power: float = 0.4,
     device: torch.device = None,
     offload: bool = False,
+    sequential_offload: bool = False,
     step_callback=None,
 ) -> Image.Image:
     """
     Full RealRestorer inference pipeline.
     Returns a single restored PIL image.
 
-    When offload=True, each component is moved to GPU only when needed,
-    then back to CPU. This trades speed for VRAM.
+    Offload modes:
+    - offload=False, sequential_offload=False: full_gpu -- everything on GPU.
+    - offload=True, sequential_offload=False: component offload -- move
+      whole components (text_encoder / transformer / vae) to GPU one at a
+      time.  Peak VRAM ~ size of the largest component (~24 GB transformer).
+    - sequential_offload=True: block-level streaming -- only the lightweight
+      non-block parts of the transformer are loaded to GPU; each transformer
+      block is moved to GPU individually, run, and moved back.  Peak VRAM
+      drops to ~4-8 GB depending on resolution.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # sequential_offload implies component-level offload for the other parts
+    if sequential_offload:
+        offload = True
 
     # Seed
     generator_device = device if device.type == "cuda" else torch.device("cpu")
@@ -370,6 +415,13 @@ def run_realrestorer(
     if offload:
         _offload_to_cpu(vae, "VAE (encode)")
 
+    # Create the PIL image for text encoder BEFORE freeing ref_images_raw
+    pil_for_encode = _tensor_to_pil(ref_images_raw[0])
+    # Free the raw image tensor -- no longer needed
+    del ref_images_raw, ref_latents_tensor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Noise
     latent_channels = getattr(vae, "latent_channels", 16)
     noise = torch.randn(
@@ -377,12 +429,12 @@ def run_realrestorer(
         generator=generator, device=device, dtype=torch.bfloat16,
     )
     latents = _pack_latents(noise)
+    del noise
 
     # --- Phase 2: Prompt encoding ---
     print("[RealRestorer] Encoding prompt with Qwen2.5-VL...", flush=True)
     if offload:
         text_encoder.to(device)
-    pil_for_encode = _tensor_to_pil(ref_images_raw[0])
     prompt_embeds, prompt_mask = _get_qwenvl_embeds(
         text_encoder, processor,
         prompts=[prompt, negative_prompt],
@@ -392,6 +444,7 @@ def run_realrestorer(
         dtype=next(text_encoder.parameters()).dtype,
         max_token_length=max_token_length,
     )
+    del pil_for_encode
     if offload:
         _offload_to_cpu(text_encoder, "text_encoder")
 
@@ -414,6 +467,7 @@ def run_realrestorer(
         dtype=prompt_embeds.dtype, device=device, axis0=ref_axis,
     )
     combined_img_ids = torch.cat([img_ids, ref_img_ids], dim=1)
+    del img_ids, ref_img_ids
 
     # Scheduler
     scheduler = RealRestorerFlowMatchScheduler()
@@ -426,7 +480,54 @@ def run_realrestorer(
 
     # --- Phase 3: Denoise ---
     print(f"[RealRestorer] Denoising ({num_inference_steps} steps)...", flush=True)
-    if offload:
+
+    # Determine how to place the transformer on the compute device
+    block_device_arg = None
+    preloaded_blocks = []  # track which blocks we moved to GPU for cleanup
+    if sequential_offload:
+        # Move the lightweight non-block parts to GPU (~1-2 GB)
+        _move_transformer_nonblocks(transformer, device)
+        block_device_arg = device
+
+        # --- Partial block residency ---
+        # Pre-load as many blocks as will fit in free VRAM.  Blocks already
+        # on GPU are run directly in the forward pass; only overflow blocks
+        # get streamed from CPU.
+        all_blocks = list(transformer.double_blocks) + list(transformer.single_blocks)
+        n_preloaded = 0
+        if torch.cuda.is_available():
+            free_vram = torch.cuda.mem_get_info(device.index or 0)[0]
+            safety_margin = int(1.5 * 1024**3)  # 1.5 GB headroom for activations
+            available = max(0, free_vram - safety_margin)
+
+            # Estimate block size from the first block's parameters
+            first_block = all_blocks[0]
+            block_bytes = sum(
+                p.numel() * p.element_size() for p in first_block.parameters()
+            )
+            n_blocks_fit = min(len(all_blocks), int(available // block_bytes)) if block_bytes > 0 else 0
+
+            if n_blocks_fit > 0:
+                for blk in all_blocks[:n_blocks_fit]:
+                    blk.to(device)
+                    preloaded_blocks.append(blk)
+                n_preloaded = n_blocks_fit
+
+        n_streaming = len(all_blocks) - n_preloaded
+        if n_streaming == 0:
+            print(
+                f"[RealRestorer] All {len(all_blocks)} blocks fit in VRAM "
+                f"-- no streaming needed.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[RealRestorer] Pre-loaded {n_preloaded}/{len(all_blocks)} blocks to GPU, "
+                f"streaming remaining {n_streaming} from CPU.",
+                flush=True,
+            )
+    elif offload:
+        # Standard component offload: move the whole transformer to GPU (~24 GB)
         transformer.to(device)
 
     # Wrap the external callback with height/width context
@@ -453,10 +554,23 @@ def run_realrestorer(
             timesteps_truncate=timesteps_truncate,
             process_norm_power=process_norm_power,
             step_callback=_internal_step_cb,
+            block_device=block_device_arg,
         )
     print("", flush=True)  # newline after the step counter
-    if offload:
+
+    if sequential_offload:
+        # Move any pre-loaded blocks back to CPU
+        for blk in preloaded_blocks:
+            blk.to("cpu")
+        _offload_transformer_nonblocks(transformer)
+        print("[RealRestorer] Offloaded transformer to CPU.", flush=True)
+    elif offload:
         _offload_to_cpu(transformer, "transformer")
+
+    # Free denoising intermediates before VAE decode
+    del prompt_embeds, prompt_mask, ref_latents, combined_img_ids, txt_ids
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # --- Phase 4: VAE decode ---
     print("[RealRestorer] Decoding with VAE...", flush=True)
